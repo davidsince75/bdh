@@ -10,43 +10,46 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# On a Mac you can also try
-# device=torch.device('mps')
 
-dtype = (
-    "bfloat16"
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    else "float16"
-)  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-ptdtype = {
-    "float32": torch.float32,
-    "bfloat16": torch.bfloat16,
-    "float16": torch.float16,
-}[dtype]
-ctx = (
-    torch.amp.autocast(device_type=device.type, dtype=ptdtype)
-    if "cuda" in device.type
-    else nullcontext()
-)
-scaler = torch.amp.GradScaler(device=device.type, enabled=(dtype == "float16"))
-torch.manual_seed(1337)
-torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
+# Force full precision for GTX 1650 Ti (no bfloat16/float16 support)
+dtype = "float32"
+ptdtype = torch.float32
+ctx = nullcontext()  # No mixed precision
+
+# Disable AMP/GradScaler because float32 doesn't need it
+scaler = None
+
+# Optional: allow TF32 (safe on Ampere+, won't affect GTX 1650 Ti)
+# Using new API to avoid deprecation warnings
+try:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+except AttributeError:
+    pass  # Older PyTorch versions
+
 print(f"Using device: {device} with dtype {dtype}")
 
+# Configuration - Optimized for low-end hardware
+BATCH_SIZE = 16           # Very small batch size to reduce memory usage
+BLOCK_SIZE = 128         # Shorter sequences for less memory
+LEARNING_RATE = 3e-4     # Standard learning rate
+WEIGHT_DECAY = 0.1       # Weight decay for regularization
+MAX_ITERS = 10000         # Number of training iterations
+LOG_FREQ = 50            # How often to print loss
 
-# Configuration
-BDH_CONFIG = bdh.BDHConfig()
-BLOCK_SIZE = 512
-BATCH_SIZE = 32
-MAX_ITERS = 3000
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 0.1
-LOG_FREQ = 100
+BDH_CONFIG = bdh.BDHConfig(
+    vocab_size=256,                # byte-level
+    n_layer=3,                     # Minimal layers for low-end hardware
+    n_head=2,                      # Minimal attention heads
+    n_embd=256,                    # Small hidden state
+    mlp_internal_dim_multiplier=64,  # Reduced from default 128
+    dropout=0.1,                   # Standard dropout
+)
+
 
 input_file_path = os.path.join(os.path.dirname(__file__), "input.txt")
-
 
 # Fetch the tiny Shakespeare dataset
 def fetch_data():
@@ -55,9 +58,8 @@ def fetch_data():
         with open(input_file_path, "w") as f:
             f.write(requests.get(data_url).text)
 
-
+# Load a training batch
 def get_batch(split):
-    # treat the file as bytes
     data = np.memmap(input_file_path, dtype=np.uint8, mode="r")
     if split == "train":
         data = data[: int(0.9 * len(data))]
@@ -68,59 +70,64 @@ def get_batch(split):
         [torch.from_numpy((data[i : i + BLOCK_SIZE]).astype(np.int64)) for i in ix]
     )
     y = torch.stack(
-        [
-            torch.from_numpy((data[i + 1 : i + 1 + BLOCK_SIZE]).astype(np.int64))
-            for i in ix
-        ]
+        [torch.from_numpy((data[i + 1 : i + 1 + BLOCK_SIZE]).astype(np.int64)) for i in ix]
     )
-    if torch.cuda.is_available():
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(
-            device, non_blocking=True
-        )
-    else:
-        x, y = x.to(device), y.to(device)
+    x, y = x.to(device), y.to(device)
     return x, y
 
-
-def eval(model):
-    model.eval()
-
-
+# Main training loop
 if __name__ == "__main__":
     fetch_data()
 
-    model = bdh.BDH(BDH_CONFIG).to(device)
-    model = torch.compile(model)
+    model = bdh.BDH(BDH_CONFIG).to(device=device, dtype=ptdtype)
+
+    # Optional: remove compile() for older GPUs
+    # model = torch.compile(model)  # Uncomment only if torch.compile works on your setup
+
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
     )
 
-    x, y = get_batch("train")
-
     loss_acc = 0
     loss_steps = 0
+
     for step in range(MAX_ITERS):
+        x, y = get_batch("train")
         with ctx:
             logits, loss = model(x, y)
-        x, y = get_batch("train")
-        loss_acc += loss
-        loss_steps += 1
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        loss.backward()
+        optimizer.step()
         optimizer.zero_grad()
+
+        loss_acc += loss.item()
+        loss_steps += 1
+
         if step % LOG_FREQ == 0:
-            print(f"Step: {step}/{MAX_ITERS} loss {loss_acc.item() / loss_steps:.3}")
+            print(f"Step: {step}/{MAX_ITERS} loss {loss_acc / loss_steps:.3f}")
             loss_acc = 0
             loss_steps = 0
-    print("Training done, now generating a sample ")
+
+    print("Training done! Saving model...")
+
+    # Save the trained model in the same directory as this script
+    model_path = os.path.join(os.path.dirname(__file__), "model.pt")
+    torch.save(model.state_dict(), model_path)
+    print(f"Model saved to {model_path}")
+
+    print("\nGenerating a sample...")
+
     model.eval()
     prompt = torch.tensor(
         bytearray("To be or ", "utf-8"), dtype=torch.long, device=device
     ).unsqueeze(0)
+
     ret = model.generate(prompt, max_new_tokens=100, top_k=3)
     ret_decoded = bytes(ret.to(torch.uint8).to("cpu").squeeze(0)).decode(
         errors="backslashreplace"
     )
     print(ret_decoded)
+
+    print("\n" + "=" * 60)
+    print("To interact with the model, run: python interact.py")
+    print("=" * 60)
+
