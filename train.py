@@ -22,10 +22,10 @@ ctx = nullcontext()  # No mixed precision
 scaler = None
 
 # Optional: allow TF32 (safe on Ampere+, won't affect GTX 1650 Ti)
-# Using new API to avoid deprecation warnings
+# Using new API (PyTorch 2.9+)
 try:
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'
+    torch.backends.cudnn.conv.fp32_precision = 'tf32'
 except AttributeError:
     pass  # Older PyTorch versions
 
@@ -36,7 +36,7 @@ BATCH_SIZE = 16           # Very small batch size to reduce memory usage
 BLOCK_SIZE = 128         # Shorter sequences for less memory
 LEARNING_RATE = 3e-4     # Standard learning rate
 WEIGHT_DECAY = 0.1       # Weight decay for regularization
-MAX_ITERS = 10000         # Number of training iterations
+MAX_ITERS = 5000         # Number of training iterations
 LOG_FREQ = 50            # How often to print loss
 
 BDH_CONFIG = bdh.BDHConfig(
